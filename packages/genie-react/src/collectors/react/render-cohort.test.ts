@@ -240,6 +240,47 @@ describe('render lifecycle cohorts', () => {
     })
   })
 
+  it('withholds lifecycle verdicts only while deferred unmounts remain pending', () => {
+    const root = component('Root')
+    attach(root, [component('Row')])
+    commit(root)
+    startObservation()
+    const gaps = {
+      skippedCommitFibers: 0,
+      droppedUnmountFibers: 0,
+      analysisFailedFibers: 0,
+      truncatedInputFibers: 0,
+      budgetExhaustedCommits: 1,
+      budgetExhaustedSubsystems: [{ subsystem: 'pending-unmounts', commits: 1 }],
+      pendingUnmountFibers: 1,
+    }
+
+    expect(getRenderCohort(root, { component: 'Row', exact: true, limit: 10 }, gaps)).toMatchObject(
+      {
+        status: 'unknown',
+        mountedIdle: 0,
+        mountedUnknown: 1,
+        coverage: { complete: false },
+      },
+    )
+    expect(
+      getRenderCohort(root, { component: 'Missing', exact: true, limit: 10 }, gaps).status,
+    ).toBe('unknown')
+
+    const processed = { ...gaps, pendingUnmountFibers: 0 }
+    expect(
+      getRenderCohort(root, { component: 'Row', exact: true, limit: 10 }, processed),
+    ).toMatchObject({
+      status: 'mounted-idle',
+      mountedIdle: 1,
+      mountedUnknown: 0,
+      coverage: { complete: false },
+    })
+    expect(
+      getRenderCohort(root, { component: 'Missing', exact: true, limit: 10 }, processed).status,
+    ).toBe('absent')
+  })
+
   it('withholds a verdict only from the instances whose own render went unanalyzed', () => {
     const root = component('Root')
     const reached = component('Row', 'reached')
@@ -266,6 +307,51 @@ describe('render lifecycle cohorts', () => {
       mountedIdle: 1,
       mountedUnknown: 1,
     })
+  })
+
+  it('fails closed when bounded skipped-render identity detail overflows', () => {
+    const root = component('Root')
+    const row = component('Row')
+    attach(root, [row])
+    commit(root)
+    startObservation()
+    for (let index = 0; index < 1_000; index += 1) {
+      noteUnanalyzedInstanceRender(component(`Skipped${index}`))
+    }
+    const gaps = {
+      skippedCommitFibers: 1_000,
+      droppedUnmountFibers: 0,
+      analysisFailedFibers: 0,
+      truncatedInputFibers: 0,
+    }
+
+    expect(getRenderCohort(root, { component: 'Row', exact: true, limit: 10 }, gaps)).toMatchObject(
+      { status: 'mounted-idle', mountedIdle: 1, mountedUnknown: 0 },
+    )
+
+    noteUnanalyzedInstanceRender(component('Skipped1000'))
+    const overflowedGaps = { ...gaps, skippedCommitFibers: 1_001 }
+    const overflowed = getRenderCohort(
+      root,
+      { component: 'Row', exact: true, limit: 10 },
+      overflowedGaps,
+    )
+    expect(overflowed).toMatchObject({
+      status: 'unknown',
+      mountedIdle: 0,
+      mountedUnknown: 1,
+      coverage: { complete: false },
+    })
+    expect(overflowed.coverage).not.toHaveProperty('unanalyzedRenderIdentityComplete')
+    expect(
+      getRenderCohort(root, { component: 'Missing', exact: true, limit: 10 }, overflowedGaps)
+        .status,
+    ).toBe('unknown')
+
+    noteInstanceRender(row, 'update', 1, 1)
+    expect(
+      getRenderCohort(root, { component: 'Row', exact: true, limit: 10 }, overflowedGaps),
+    ).toMatchObject({ status: 'updated', mountedUpdated: 1, mountedUnknown: 0 })
   })
 
   it('prefers an observed render over a later commit that skipped the same instance', () => {

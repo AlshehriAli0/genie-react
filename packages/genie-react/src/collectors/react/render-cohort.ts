@@ -71,6 +71,8 @@ export interface RenderCoverageGaps {
   propsNotEnumeratedFibers?: number
   budgetExhaustedCommits?: number
   budgetExhaustedSubsystems?: { subsystem: string; commits: number }[]
+  /** Internal live queue depth; intentionally omitted from the public coverage payload. */
+  pendingUnmountFibers?: number
 }
 
 const COHORT_SCAN_LIMIT = 20_000
@@ -142,8 +144,9 @@ export function getRenderCohort(
   // Duplicate roots/fibers left on the stack do not represent missing data.
   const scanTruncated = stack.some((fiber) => !visitedFibers.has(fiber))
   const identityCoverage = getInstanceIdentityCoverage()
+  const { pendingUnmountFibers = 0, ...reportedCoverageGaps } = coverageGaps
   const effectiveCoverageGaps = {
-    ...coverageGaps,
+    ...reportedCoverageGaps,
     droppedUnmountFibers:
       coverageGaps.droppedUnmountFibers +
       identityCoverage.droppedTombstones +
@@ -162,6 +165,8 @@ export function getRenderCohort(
     rootScopeComplete &&
     scannedRootCount === rootCount &&
     !scanTruncated &&
+    pendingUnmountFibers === 0 &&
+    identityCoverage.unanalyzedRenderIdentityComplete &&
     effectiveCoverageGaps.droppedUnmountFibers === 0 &&
     effectiveCoverageGaps.analysisFailedFibers === 0 &&
     effectiveCoverageGaps.generationHistoryEvictions === 0
