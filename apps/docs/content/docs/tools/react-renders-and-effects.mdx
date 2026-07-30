@@ -18,6 +18,11 @@ Clears render counters and starts a new causal observation window.
 defaults to `{bufferLimit:1000,targetReserve:100}`; `bufferLimit` is an integer from 100 to 20000,
 `targetReserve` is an integer from 0 to 5000, and the reserve cannot exceed the buffer.
 
+The expanded maxima are opt-in; defaults are unchanged. `adaptive:true` increases only later commit
+budgets after exhaustion and cannot restore evidence skipped by the exhausted commit. For a
+one-action window, especially on a large React Native tree, discard incomplete coverage and rerun
+the action from a fresh window with an explicitly larger budget.
+
 ```bash
 npx @genie-react/cli call react_clear_renders \
   '{"components":["ProductCard"],"budget":{"fiberLimit":500,"timeLimitMs":12}}' --json
@@ -45,7 +50,9 @@ npx @genie-react/cli call react_clear_renders \
 
 **Agent use:** Drive exactly one interaction next, then join render and effect evidence by
 `observation.id`. This call discards earlier counters and starts fresh retained histories, so capture
-needed evidence before clearing again.
+needed evidence before clearing again. Use the subsequent render and cause evidence only when its
+coverage is complete and `budgetExhaustedCommits` is zero; adaptive recovery later in the window
+does not repair an earlier incomplete commit.
 
 ## `react_get_renders`
 
@@ -649,6 +656,11 @@ Clears render counters and starts a profiling observation.
 defaults to `{bufferLimit:1000,targetReserve:100}`; `bufferLimit` is an integer from 100 to 20000,
 `targetReserve` is an integer from 0 to 5000, and the reserve cannot exceed the buffer.
 
+The expanded maxima are opt-in; defaults are unchanged. `adaptive:true` increases only later commit
+budgets after exhaustion and cannot restore evidence skipped by the exhausted commit. For a
+one-action profile, especially on a large React Native tree, discard incomplete coverage and rerun
+the flow from a fresh profile with an explicitly larger budget.
+
 ```bash
 npx @genie-react/cli call react_profile_start \
   '{"components":["SearchResults"],"lifecycle":{"bufferLimit":2000,"targetReserve":200}}' --json
@@ -674,7 +686,8 @@ npx @genie-react/cli call react_profile_start \
 ```
 
 **Agent use:** Run the exact flow to measure next, then stop before reading the final report. Starting
-clears current counters but keeps named snapshots for later diffs.
+clears current counters but keeps named snapshots for later diffs. Compare the result only when
+coverage is complete and `budgetExhaustedCommits` is zero.
 
 ## `react_profile_stop`
 

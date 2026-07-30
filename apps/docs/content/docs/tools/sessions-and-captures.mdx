@@ -389,6 +389,11 @@ Clears React observations and starts one bounded interaction window on the selec
 (default `true`). `lifecycle` is optional: `bufferLimit` is an integer 100–20,000 (default 1,000)
 and `targetReserve` is an integer 0–5,000 (default 100) that cannot exceed `bufferLimit`.
 
+The expanded maxima are opt-in; defaults are unchanged. This window records one named action, so
+adaptive growth after an exhausted commit cannot restore evidence skipped by that action. For a
+large React Native interaction, provide an explicit budget and rerun from a fresh window if the
+stopped React coverage is incomplete.
+
 ```bash
 npx @genie-react/cli call devtools_interaction_begin \
   '{"name":"open checkout row","components":["CheckoutRow"],"budget":{"adaptive":true}}' \
@@ -418,6 +423,7 @@ npx @genie-react/cli call devtools_interaction_begin \
 
 **Agent use:** Keep the returned `interactionId`, verify its physical document and boundary IDs,
 drive exactly one named UI action, then stop that same ID even if the UI result is surprising.
+Use the React evidence only when its coverage is complete and `budgetExhaustedCommits` is zero.
 
 **Limits:** The interaction ID is bridge-owned and is not a capture ID, observation ID, session
 alias, or marker. Only one interaction can record per physical document, with at most 20 active
