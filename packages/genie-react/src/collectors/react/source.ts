@@ -39,8 +39,12 @@ export interface SourceProvenance {
 
 export interface FiberClassification {
   source: ResolvedSource | null
+  ownership: SourceOwnership
+  /** Compatibility projection only; false does not imply app ownership. */
   isLibrary: boolean
 }
+
+export type SourceOwnership = 'app' | 'library' | 'unknown'
 
 export type SourceAttribution =
   | { role: 'usage-or-definition-fallback'; evidence: 'inferred' }
@@ -95,15 +99,21 @@ const cache = new Map<number, ResolvedSource>()
 const pendingSource = new Map<number, Promise<ResolvedSource | null>>()
 let cacheGeneration = 0
 const ANCESTOR_HOPS = 20
+const OWNED_DEFINITION_SCAN_LIMIT = 200
 const DEFAULT_CLASSIFY_LIMIT = 120
 const DEFAULT_CLASSIFY_BUDGET_MS = 500
-const UNCLASSIFIED_FIBER: FiberClassification = { source: null, isLibrary: false }
+const UNCLASSIFIED_FIBER: FiberClassification = {
+  source: null,
+  ownership: 'unknown',
+  isLibrary: false,
+}
 
 export function clearSourceCache(): void {
   cacheGeneration += 1
   cache.clear()
   pendingSource.clear()
   metroFrameCache.clear()
+  pendingMetroFrame.clear()
   moduleMapCache.clear()
   warmupQueue = []
   activeWarmup = null
@@ -121,33 +131,34 @@ export async function resolveSource(fiber: Fiber): Promise<ResolvedSource | null
   let lookup!: Promise<ResolvedSource | null>
   lookup = (async () => {
     try {
-      const source = await safeFiberSource(getLatestFiber(fiber) ?? fiber)
+      const target = getLatestFiber(fiber) ?? fiber
+      const source = await safeFiberSource(target)
       if (generation !== cacheGeneration) return null
       if (!source?.fileName) return null
-      const servedFile = normalizeFileName(source.fileName)
-      const original = await toOriginalPosition(
-        source.fileName,
-        source.lineNumber ?? null,
-        source.columnNumber ?? null,
-        generation,
-      )
-      if (generation !== cacheGeneration) return null
-      const position = selectSourcePosition(
-        servedFile,
-        source.lineNumber ?? null,
-        source.columnNumber ?? null,
-        original,
-      )
-      const resolved: ResolvedSource = {
-        ...position,
-        functionName: source.functionName ?? null,
-        sourceMapConfidence:
-          source.sourceMapConfidence === 'mapped' ||
-          (original.file !== null && position.file === original.file)
-            ? 'mapped'
-            : 'served',
+      let resolved = await resolveCapturedSource(source, generation)
+      if (!resolved || generation !== cacheGeneration) return null
+      let cacheable = sourceOwnershipForSource(resolved) !== 'unknown'
+
+      // A React 19 child-owner edge can recover an app body frame from a framework-owned usage frame without invoking user code.
+      if (sourceOwnershipForSource(resolved) === 'library') {
+        try {
+          const ownedDefinition = await safeOwnedDefinitionSource(target)
+          const ownedSource = ownedDefinition
+            ? await resolveCapturedSource(ownedDefinition, generation)
+            : null
+          const ownedOwnership = sourceOwnershipForSource(ownedSource)
+          if (ownedOwnership === 'app' && ownedSource) {
+            resolved = ownedSource
+          } else if (ownedDefinition && ownedOwnership === 'unknown') {
+            cacheable = false
+          }
+        } catch {
+          // Definition recovery is optional; retain the already-resolved usage frame.
+          cacheable = false
+        }
       }
-      if (generation === cacheGeneration) cache.set(id, resolved)
+      if (generation !== cacheGeneration) return null
+      if (cacheable) cache.set(id, resolved)
       return resolved
     } catch {
       return null
@@ -157,6 +168,35 @@ export async function resolveSource(fiber: Fiber): Promise<ResolvedSource | null
   })()
   pendingSource.set(id, lookup)
   return lookup
+}
+
+async function resolveCapturedSource(
+  source: SafeFiberSource,
+  generation: number,
+): Promise<ResolvedSource | null> {
+  const servedFile = normalizeServedFileName(source.fileName)
+  const original = await toOriginalPosition(
+    source.fileName,
+    source.lineNumber ?? null,
+    source.columnNumber ?? null,
+    generation,
+  )
+  if (generation !== cacheGeneration) return null
+  const position = selectSourcePosition(
+    servedFile,
+    source.lineNumber ?? null,
+    source.columnNumber ?? null,
+    original,
+  )
+  return {
+    ...position,
+    functionName: source.functionName ?? null,
+    sourceMapConfidence:
+      source.sourceMapConfidence === 'mapped' ||
+      (original.file !== null && position.file === original.file)
+        ? 'mapped'
+        : 'served',
+  }
 }
 
 interface SafeFiberSource {
@@ -184,21 +224,32 @@ async function safeFiberSource(fiber: Fiber): Promise<SafeFiberSource | null> {
     }
   }
 
+  const frame = capturedDebugFrames(fiber).find((entry) => typeof entry.fileName === 'string')
+  return frame ? symbolicateCapturedFrame(frame) : null
+}
+
+function capturedDebugFrames(fiber: Fiber): ReturnType<typeof parseStack> {
   const debugStack = dataPropertyValue(fiber, '_debugStack')
-  if (!(debugStack instanceof Error)) return null
+  if (!(debugStack instanceof Error)) return []
   // Hermes exposes Error.stack lazily; this React-created Error is the only accessor read, so app-object reads stay descriptor-safe.
   let stack: unknown
   try {
     stack = debugStack.stack
   } catch {
-    return null
+    return []
   }
-  if (typeof stack !== 'string') return null
+  if (typeof stack !== 'string') return []
   const trustedStack = formatOwnerStack(stack)
-  if (!trustedStack) return null
-  const frame = parseStack(trustedStack).find((entry) => typeof entry.fileName === 'string')
-  if (!frame?.fileName) return null
-  const [symbolicated] = await symbolicateStack([frame])
+  return trustedStack ? parseStack(trustedStack) : []
+}
+
+async function symbolicateCapturedFrame(
+  frame: ReturnType<typeof parseStack>[number],
+): Promise<SafeFiberSource | null> {
+  if (!frame.fileName) return null
+  const symbolicated = METRO_BUNDLE_URL_RE.test(frame.fileName)
+    ? undefined
+    : (await symbolicateStack([frame]))[0]
   const resolved = symbolicated?.fileName ? symbolicated : frame
   const symbolicationChangedPosition =
     symbolicated?.fileName !== undefined &&
@@ -216,6 +267,67 @@ async function safeFiberSource(fiber: Fiber): Promise<SafeFiberSource | null> {
     : null
 }
 
+async function safeOwnedDefinitionSource(fiber: Fiber): Promise<SafeFiberSource | null> {
+  const callableName = stableCallableName(fiber.type)
+  const componentName = callableName ?? getDisplayName(fiber.type)
+  if (!componentName) return null
+  const stack: Fiber[] = fiber.child ? [fiber.child] : []
+  let visited = 0
+  while (stack.length > 0 && visited < OWNED_DEFINITION_SCAN_LIMIT) {
+    const child = stack.pop()
+    if (!child) continue
+    visited += 1
+    if (child.sibling) stack.push(child.sibling)
+    if (child.child) stack.push(child.child)
+    const owner = dataPropertyValue(child, '_debugOwner')
+    const alternate = fiber.alternate
+    const ownedByAlternate = alternate !== null && alternate !== undefined && owner === alternate
+    if (owner !== fiber && !ownedByAlternate) continue
+    const frames = capturedDebugFrames(child)
+    for (let index = frames.length - 1; index >= 0; index -= 1) {
+      const frame = frames[index]
+      if (
+        !frame?.fileName ||
+        !frameFunctionMatchesComponent(frame.functionName, componentName, callableName !== null)
+      ) {
+        continue
+      }
+      return symbolicateCapturedFrame({
+        ...frame,
+        lineNumber: frame.enclosingLineNumber || frame.lineNumber,
+        columnNumber: frame.enclosingColumnNumber || frame.columnNumber,
+      })
+    }
+  }
+  return null
+}
+
+function stableCallableName(value: unknown): string | null {
+  if (typeof value === 'function') {
+    const name = dataPropertyValue(value, 'name')
+    return typeof name === 'string' && name.length > 0 ? name : null
+  }
+  if (!isRecord(value)) return null
+  const render = dataPropertyValue(value, 'render')
+  if (typeof render !== 'function') return null
+  const name = dataPropertyValue(render, 'name')
+  return typeof name === 'string' && name.length > 0 ? name : null
+}
+
+function frameFunctionMatchesComponent(
+  frameFunctionName: string | undefined,
+  componentName: string,
+  requireExact: boolean,
+): boolean {
+  if (!frameFunctionName) return false
+  if (requireExact) return frameFunctionName === componentName
+  const wrappedName = /^(?:Memo|ForwardRef)\((.+)\)$/.exec(componentName)?.[1]
+  const candidates = wrappedName ? [componentName, wrappedName] : [componentName]
+  return candidates.some(
+    (candidate) => frameFunctionName === candidate || frameFunctionName.endsWith(`.${candidate}`),
+  )
+}
+
 function dataPropertyValue(value: object, key: PropertyKey): unknown {
   const descriptor = safeOwnPropertyDescriptor(value, key)
   return isDataDescriptor(descriptor) ? descriptor.value : undefined
@@ -227,12 +339,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** A file outside the project tree is a library. Turbopack can expose app fibers as unmapped dev chunks, and an unsymbolicated Metro bundle entry names the whole app; neither carries attribution, so neither is evidence of a library. */
 export function isLibraryFile(file: string): boolean {
-  if (file.replaceAll('\\', '/').includes('/.next/dev/server/chunks/')) return false
-  if (METRO_BUNDLE_PATH_RE.test(file)) return false
+  if (isOpaqueBundlerFile(file)) return false
   return !isSourceFile(file)
 }
 
-/** App vs library by resolved source, climbing to the nearest ancestor that resolves; unresolved stays app so a missing source never silently hides a component. */
+export function sourceOwnershipForSource(source: ResolvedSource | null): SourceOwnership {
+  if (!source || isOpaqueBundlerFile(source.file)) return 'unknown'
+  return isLibraryFile(source.file) ? 'library' : 'app'
+}
+
+function isOpaqueBundlerFile(file: string): boolean {
+  const normalized = file.replaceAll('\\', '/')
+  return normalized.includes('/.next/dev/server/chunks/') || METRO_BUNDLE_PATH_RE.test(normalized)
+}
+
+function classificationForSource(source: ResolvedSource | null): FiberClassification {
+  const ownership = sourceOwnershipForSource(source)
+  return { source, ownership, isLibrary: ownership === 'library' }
+}
+
+/** Resolve affirmative app/library evidence, climbing to the nearest ancestor; unresolved ownership stays unknown. */
 export async function classifyFiber(fiber: Fiber): Promise<FiberClassification> {
   const generation = cacheGeneration
   let current: Fiber | null = fiber
@@ -240,10 +366,10 @@ export async function classifyFiber(fiber: Fiber): Promise<FiberClassification> 
     if (generation !== cacheGeneration) return UNCLASSIFIED_FIBER
     const source = await resolveSource(current)
     if (generation !== cacheGeneration) return UNCLASSIFIED_FIBER
-    if (source) return { source, isLibrary: isLibraryFile(source.file) }
+    if (source) return classificationForSource(source)
     current = current.return
   }
-  return { source: null, isLibrary: false }
+  return UNCLASSIFIED_FIBER
 }
 
 export async function classifyFiberBeforeDeadline(
@@ -266,7 +392,7 @@ export async function classifyFiberBeforeDeadline(
 /** Cache-only classification: exact when the fiber itself resolved before, null when unknown (never guesses via ancestors, which classifyFiber resolves differently). */
 function classifyFiberFromCache(fiber: Fiber): FiberClassification | null {
   const cached = cache.get(getFiberId(fiber))
-  return cached ? { source: cached, isLibrary: isLibraryFile(cached.file) } : null
+  return cached ? classificationForSource(cached) : null
 }
 
 // Cache hits are free and bypass the budget, so repeated reads warm the whole set ~limit fibers per call until partial goes false; only network-bound resolutions spend limit/budgetMs.
@@ -378,7 +504,9 @@ export function sourceProvenanceForSource(
     hookDefinitionOwner: exact.hookDefinitionOwner ?? null,
     hookCallsite: exact.hookCallsite ?? null,
     package:
-      roleSource && isLibraryFile(roleSource.file) ? packageNameFromFile(roleSource.file) : null,
+      sourceOwnershipForSource(roleSource) === 'library' && roleSource
+        ? packageNameFromFile(roleSource.file)
+        : null,
     sourceMapConfidence: roleSource?.sourceMapConfidence ?? (roleSource ? 'served' : 'unknown'),
     failureReason: hasExactRole
       ? null
@@ -491,8 +619,15 @@ interface MappedPosition {
 }
 
 const METRO_BUNDLE_PATH_RE = /\.(?:js)?bundle$/
-const METRO_BUNDLE_URL_RE = /^(https?:\/\/[^/?#]+)\/[^?#]*\.(?:js)?bundle(?:[?#]|$)/
+const METRO_BUNDLE_URL_RE = /^(https?:\/\/[^/?#]+)\/[^?#]*\.(?:js)?bundle(?=\/\/&|[?#]|$)/
+const NATIVE_METRO_BUNDLE_PARAMS_RE = /(\.(?:js)?bundle)\/\/&.*$/i
+const METRO_SYMBOLICATE_TIMEOUT_MS = 1_000
 const metroFrameCache = new Map<string, MappedPosition>()
+const pendingMetroFrame = new Map<string, Promise<MappedPosition | null>>()
+
+function normalizeServedFileName(file: string): string {
+  return normalizeFileName(file).replaceAll('\\', '/').replace(NATIVE_METRO_BUNDLE_PARAMS_RE, '$1')
+}
 
 /** Metro's dev bundle and its source map are both far too large to pull into the app, so ask the dev server the way LogBox does. Only successes are cached, so a transient failure can recover. */
 async function metroOriginalPosition(
@@ -505,9 +640,21 @@ async function metroOriginalPosition(
   const key = `${servedUrl}|${line}|${column}`
   const cached = metroFrameCache.get(key)
   if (cached) return cached
-  const mapped = await symbolicateMetroFrame(origin, servedUrl, line, column)
-  if (mapped && generation === cacheGeneration) metroFrameCache.set(key, mapped)
-  return mapped
+  const pending = pendingMetroFrame.get(key)
+  if (pending) return pending
+
+  let lookup!: Promise<MappedPosition | null>
+  lookup = (async () => {
+    try {
+      const mapped = await symbolicateMetroFrame(origin, servedUrl, line, column)
+      if (mapped && generation === cacheGeneration) metroFrameCache.set(key, mapped)
+      return mapped
+    } finally {
+      if (pendingMetroFrame.get(key) === lookup) pendingMetroFrame.delete(key)
+    }
+  })()
+  pendingMetroFrame.set(key, lookup)
+  return lookup
 }
 
 async function symbolicateMetroFrame(
@@ -516,18 +663,30 @@ async function symbolicateMetroFrame(
   line: number,
   column: number,
 ): Promise<MappedPosition | null> {
+  const controller = typeof AbortController === 'undefined' ? null : new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    const response = await fetch(`${origin}/symbolicate`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ stack: [{ file: servedUrl, lineNumber: line, column }] }),
-    })
+    const response = await Promise.race([
+      fetch(`${origin}/symbolicate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stack: [{ file: servedUrl, lineNumber: line, column }] }),
+        ...(controller ? { signal: controller.signal } : {}),
+      }),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => {
+          controller?.abort()
+          resolve(null)
+        }, METRO_SYMBOLICATE_TIMEOUT_MS)
+      }),
+    ])
+    if (!response) return null
     const payload: unknown = response.ok ? await response.json() : null
     const frame = isRecord(payload) && Array.isArray(payload.stack) ? payload.stack[0] : null
     if (!isRecord(frame) || typeof frame.file !== 'string') return null
     if (typeof frame.lineNumber !== 'number') return null
     // Metro echoes the bundle entry back when it cannot map the frame.
-    const file = normalizeFileName(frame.file)
+    const file = normalizeServedFileName(frame.file)
     if (!file || METRO_BUNDLE_PATH_RE.test(file)) return null
     return {
       file,
@@ -536,6 +695,8 @@ async function symbolicateMetroFrame(
     }
   } catch {
     return null
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -600,7 +761,7 @@ async function resolveHookSource(
 ): Promise<ResolvedSource | null> {
   try {
     if (!hook?.fileName || generation !== cacheGeneration) return null
-    const served = normalizeFileName(hook.fileName)
+    const served = normalizeServedFileName(hook.fileName)
     if (!served) return null
     const original = await toOriginalPosition(
       hook.fileName,
@@ -773,8 +934,7 @@ export async function resolveExternalStoreSourceResolution(
       )
       return {
         callsite:
-          hookAncestry.find((frame) => frame.source !== null && !isLibraryFile(frame.source.file))
-            ?.source ??
+          hookAncestry.find((frame) => sourceOwnershipForSource(frame.source) === 'app')?.source ??
           hookAncestry.find((frame) => frame.source !== null)?.source ??
           primitiveSource,
         primitiveSource,
