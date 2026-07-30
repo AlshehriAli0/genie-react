@@ -24,6 +24,7 @@ import {
   getPropsNotEnumeratedFiberCount,
   getRenderCauseEventsReport,
   getRenderCauseMeasurement,
+  getRenderObservationConfig,
   getRenders,
   getRendersLeaderboardsMeasurement,
   getRendersMeasurement,
@@ -1068,6 +1069,20 @@ describe('recordRender unnecessary accounting', () => {
 })
 
 describe('commit analysis budget', () => {
+  const exhaustOneCommit = (): void => {
+    const budget = createCommitAnalysisBudget(250, {
+      operationLimit: 1,
+      timeLimitMs: 100,
+      now: () => 0,
+    })
+    recordCommitFiber(
+      componentFiber({ name: 'Exhausting', props: { value: 2 }, prevProps: { value: 1 } }),
+      'update',
+      budget,
+    )
+    finalizeCommitAnalysisBudget(budget)
+  }
+
   it('keeps named targets in a reserved lane after the general fiber budget is exhausted', async () => {
     clearRenders({ components: ['CriticalRow'] })
     const budget = createCommitAnalysisBudget(
@@ -1090,6 +1105,67 @@ describe('commit analysis budget', () => {
       skippedFibers: 0,
       complete: true,
     })
+  })
+
+  it('keeps the target time reserve spendable after the general time budget runs out', async () => {
+    clearRenders({ components: ['CriticalRow'] })
+    let clock = 0
+    const budget = createCommitAnalysisBudget(
+      50,
+      { operationLimit: 10_000, timeLimitMs: 10, now: () => clock },
+      { operationLimit: 10_000, timeLimitMs: 5, now: () => clock },
+    )
+    clock = 12
+
+    recordCommitFiber(componentFiber({ name: 'BackgroundRow', props: {} }), 'mount', budget)
+    recordCommitFiber(componentFiber({ name: 'CriticalRow', props: {} }), 'mount', budget)
+
+    expect(budget.processed).toBe(0)
+    expect(budget.targetProcessed).toBe(1)
+    expect((await getRenders({ sort: 'renders', limit: 10 })).map(({ name }) => name)).toEqual([
+      'CriticalRow',
+    ])
+  })
+
+  it('honours an explicitly requested budget above the adaptive ceiling', () => {
+    clearRenders({ budget: { fiberLimit: 12_000, operationLimit: 900_000, timeLimitMs: 200 } })
+
+    expect(getRenderObservationConfig()).toMatchObject({
+      fiberLimit: 12_000,
+      operationLimit: 900_000,
+      timeLimitMs: 200,
+    })
+  })
+
+  it('grows a small budget adaptively after an exhausted commit', () => {
+    clearRenders({ budget: { fiberLimit: 250, operationLimit: 20_000, timeLimitMs: 8 } })
+    exhaustOneCommit()
+
+    expect(getRenderObservationConfig()).toMatchObject({
+      adaptiveScale: 2,
+      fiberLimit: 500,
+      operationLimit: 40_000,
+      timeLimitMs: 16,
+    })
+  })
+
+  it('stops adaptive growth at the ceiling', () => {
+    clearRenders({ budget: { fiberLimit: 20_000, operationLimit: 2_000_000, timeLimitMs: 500 } })
+    exhaustOneCommit()
+
+    expect(getRenderObservationConfig()).toMatchObject({
+      adaptiveScale: 2,
+      fiberLimit: 20_000,
+      operationLimit: 2_000_000,
+      timeLimitMs: 500,
+    })
+  })
+
+  it('does not grow a budget that opted out of adaptive scaling', () => {
+    clearRenders({ budget: { fiberLimit: 250, adaptive: false } })
+    exhaustOneCommit()
+
+    expect(getRenderObservationConfig()).toMatchObject({ fiberLimit: 250, timeLimitMs: 8 })
   })
 
   it('bounds expensive per-fiber commit analysis and records skipped candidates', async () => {

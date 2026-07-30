@@ -14,7 +14,7 @@ Clears render counters and starts a new causal observation window.
 1–160 character string. `roots` defaults to `[]` and accepts at most 20 integer component IDs.
 `budget` is optional. `fiberLimit` defaults to 250, `operationLimit` to 20000, `timeLimitMs` to 8,
 `targetOperationReserve` to 4000, `targetTimeReserveMs` to 4, and `adaptive` to `true`; the numeric ranges are
-50–5000, 1000–200000, 1–50, 100–50000, and 0.5–25 respectively. `lifecycle`
+50–20000, 1000–2000000, 1–500, 100–500000, and 0.5–250 respectively. `lifecycle`
 defaults to `{bufferLimit:1000,targetReserve:100}`; `bufferLimit` is an integer from 100 to 20000,
 `targetReserve` is an integer from 0 to 5000, and the reserve cannot exceed the buffer.
 
@@ -645,7 +645,7 @@ Clears render counters and starts a profiling observation.
 1–160 character string. `roots` defaults to `[]` and accepts at most 20 integer component IDs.
 `budget` is optional. `fiberLimit` defaults to 250, `operationLimit` to 20000, `timeLimitMs` to 8,
 `targetOperationReserve` to 4000, `targetTimeReserveMs` to 4, and `adaptive` to `true`; the numeric ranges are
-50–5000, 1000–200000, 1–50, 100–50000, and 0.5–25 respectively. `lifecycle`
+50–20000, 1000–2000000, 1–500, 100–500000, and 0.5–250 respectively. `lifecycle`
 defaults to `{bufferLimit:1000,targetReserve:100}`; `bufferLimit` is an integer from 100 to 20000,
 `targetReserve` is an integer from 0 to 5000, and the reserve cannot exceed the buffer.
 

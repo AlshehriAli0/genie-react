@@ -1,5 +1,5 @@
 const DEFAULT_OPERATION_LIMIT = 20_000
-const DEFAULT_TIME_LIMIT_MS = 8
+export const DEFAULT_TIME_LIMIT_MS = 8
 
 export interface CommitWorkBudget {
   remainingOperations: number

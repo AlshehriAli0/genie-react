@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { devtoolsInteractionBeginContract } from '../../protocol'
 import {
+  reactClearRendersContract,
   reactComponentCohortContract,
   reactEffectAuditContract,
   reactGetRendersContract,
@@ -299,5 +301,77 @@ describe('react_component_cohort contract', () => {
       limit: 50,
     })
     expect(() => reactComponentCohortContract.input.parse({ component: '', limit: 50 })).toThrow()
+  })
+})
+
+describe('react_clear_renders observation budget bounds', () => {
+  it('defaults to the low-overhead budget', () => {
+    expect(reactClearRendersContract.input.parse({}).budget).toEqual({
+      fiberLimit: 250,
+      operationLimit: 20_000,
+      timeLimitMs: 8,
+      targetOperationReserve: 4_000,
+      targetTimeReserveMs: 4,
+      adaptive: true,
+    })
+  })
+
+  it('accepts a budget large enough for a React Native screen', () => {
+    expect(
+      reactClearRendersContract.input.parse({
+        budget: {
+          fiberLimit: 20_000,
+          operationLimit: 2_000_000,
+          timeLimitMs: 500,
+          targetOperationReserve: 500_000,
+          targetTimeReserveMs: 250,
+        },
+      }).budget,
+    ).toMatchObject({
+      fiberLimit: 20_000,
+      operationLimit: 2_000_000,
+      timeLimitMs: 500,
+      targetOperationReserve: 500_000,
+      targetTimeReserveMs: 250,
+    })
+  })
+
+  it('rejects a budget beyond the ceiling', () => {
+    expect(() =>
+      reactClearRendersContract.input.parse({ budget: { fiberLimit: 20_001 } }),
+    ).toThrow()
+    expect(() => reactClearRendersContract.input.parse({ budget: { timeLimitMs: 501 } })).toThrow()
+    expect(() =>
+      reactClearRendersContract.input.parse({ budget: { operationLimit: 2_000_001 } }),
+    ).toThrow()
+    expect(() =>
+      reactClearRendersContract.input.parse({ budget: { targetTimeReserveMs: 251 } }),
+    ).toThrow()
+    expect(() =>
+      reactClearRendersContract.input.parse({ budget: { targetOperationReserve: 500_001 } }),
+    ).toThrow()
+  })
+})
+
+describe('observation budget schemas', () => {
+  it('bounds devtools_interaction_begin exactly like react_clear_renders', () => {
+    const budget = {
+      fiberLimit: 20_000,
+      operationLimit: 2_000_000,
+      timeLimitMs: 500,
+      targetOperationReserve: 500_000,
+      targetTimeReserveMs: 250,
+      adaptive: true,
+    }
+
+    expect(devtoolsInteractionBeginContract.input.parse({ name: 'press', budget }).budget).toEqual(
+      reactClearRendersContract.input.parse({ budget }).budget,
+    )
+    expect(() =>
+      devtoolsInteractionBeginContract.input.parse({
+        name: 'press',
+        budget: { ...budget, timeLimitMs: 501 },
+      }),
+    ).toThrow()
   })
 })
