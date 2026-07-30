@@ -51,6 +51,7 @@ let activeObservationId: string | null = null
 const liveInstances = new Map<number, InstanceDescriptor>()
 const generationsByPath = new Map<string, number>()
 const observedInstanceIds = new Set<number>()
+const unanalyzedRenderIds = new Set<number>()
 const tombstones: InstanceTombstone[] = []
 let droppedTombstones = 0
 let excludedLifecycleFibers = 0
@@ -60,6 +61,7 @@ let generationHistoryEvictions = 0
 export function beginInstanceObservation(observationId: string): void {
   activeObservationId = observationId
   observedInstanceIds.clear()
+  unanalyzedRenderIds.clear()
   tombstones.length = 0
   droppedTombstones = 0
   excludedLifecycleFibers = 0
@@ -149,6 +151,15 @@ export function wasInstanceObserved(instanceId: number): boolean {
   return observedInstanceIds.has(instanceId)
 }
 
+export function noteUnanalyzedInstanceRender(fiber: Fiber): void {
+  if (!activeObservationId) return
+  unanalyzedRenderIds.add(registerFiber(fiber) as number)
+}
+
+export function wasInstanceRenderUnanalyzed(instanceId: number): boolean {
+  return unanalyzedRenderIds.has(instanceId)
+}
+
 export function getInstanceTombstones(): readonly InstanceTombstone[] {
   return tombstones
 }
@@ -182,6 +193,7 @@ export function clearInstanceIdentityForTests(): void {
   liveInstances.clear()
   generationsByPath.clear()
   observedInstanceIds.clear()
+  unanalyzedRenderIds.clear()
   tombstones.length = 0
   droppedTombstones = 0
   excludedLifecycleFibers = 0

@@ -6,7 +6,7 @@ import {
   registerQueryObserver,
   registerRouterStore,
 } from '../causal/external-store-registry'
-import { wasInstanceObserved } from './instance-identity'
+import { wasInstanceObserved, wasInstanceRenderUnanalyzed } from './instance-identity'
 import {
   childrenChanged,
   clearRenders,
@@ -1102,6 +1102,37 @@ describe('commit analysis budget', () => {
     expect(budget.skipped).toBe(3)
     expect(getSkippedCommitFiberCount()).toBe(3)
     expect(await getRenders({ sort: 'renders', limit: 10 })).toHaveLength(2)
+  })
+
+  it('names every declined fiber so the cohort never mistakes it for idle', () => {
+    const budget = createCommitAnalysisBudget(1)
+    const analyzed = componentFiber({ name: 'Analyzed', props: {} })
+    const declined = componentFiber({ name: 'Declined', props: {} })
+
+    expect(recordCommitFiber(analyzed, 'mount', budget)).toBe(true)
+    expect(recordCommitFiber(declined, 'mount', budget)).toBe(false)
+
+    expect(wasInstanceRenderUnanalyzed(getFiberId(analyzed))).toBe(false)
+    expect(wasInstanceRenderUnanalyzed(getFiberId(declined))).toBe(true)
+  })
+
+  it('does not name a fiber the analyzer was never going to record', () => {
+    const budget = createCommitAnalysisBudget(0)
+    const hostFiber = asFiber({ tag: 5, type: 'View', flags: 0 })
+
+    expect(recordCommitFiber(hostFiber, 'update', budget)).toBe(false)
+    expect(wasInstanceRenderUnanalyzed(getFiberId(hostFiber))).toBe(false)
+  })
+
+  it('forgets declined fibers when a new observation starts', () => {
+    const budget = createCommitAnalysisBudget(0)
+    const declined = componentFiber({ name: 'DeclinedThenCleared', props: {} })
+    recordCommitFiber(declined, 'mount', budget)
+    expect(wasInstanceRenderUnanalyzed(getFiberId(declined))).toBe(true)
+
+    clearRenders()
+
+    expect(wasInstanceRenderUnanalyzed(getFiberId(declined))).toBe(false)
   })
 
   it('does not spend commit budget on host fibers', () => {

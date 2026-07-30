@@ -6,6 +6,7 @@ import {
   type InstanceDescriptor,
   instanceForReport,
   wasInstanceObserved,
+  wasInstanceRenderUnanalyzed,
 } from './instance-identity'
 import { getActiveObservation, type ObservationWindow } from './observation'
 
@@ -84,6 +85,7 @@ export function getRenderCohort(
     componentName: string
     instance: InstanceDescriptor
     observed: boolean
+    renderUnanalyzed: boolean
   }> = []
   const committedScope = findAllCommittedRootFibers()
   const fallbackInCommittedScope = fallbackRoot
@@ -128,6 +130,7 @@ export function getRenderCohort(
             componentName,
             instance,
             observed: wasInstanceObserved(instance.fiberId),
+            renderUnanalyzed: wasInstanceRenderUnanalyzed(instance.fiberId),
           })
         }
       }
@@ -154,23 +157,29 @@ export function getRenderCohort(
   const scannedRootCount = scannedRoots.size
   const rootAvailable = rootCount > 0
   const rootScopeComplete = committedScope.rootCount > 0 && !rootScopeTruncated
-  const complete =
+  const renderCoverageComplete =
     rootAvailable &&
     rootScopeComplete &&
     scannedRootCount === rootCount &&
     !scanTruncated &&
-    effectiveCoverageGaps.skippedCommitFibers === 0 &&
     effectiveCoverageGaps.droppedUnmountFibers === 0 &&
     effectiveCoverageGaps.analysisFailedFibers === 0 &&
-    effectiveCoverageGaps.budgetExhaustedCommits === 0 &&
     effectiveCoverageGaps.generationHistoryEvictions === 0
+  const complete =
+    renderCoverageComplete &&
+    effectiveCoverageGaps.skippedCommitFibers === 0 &&
+    effectiveCoverageGaps.budgetExhaustedCommits === 0
   const inputAttributionComplete =
     complete &&
     effectiveCoverageGaps.truncatedInputFibers === 0 &&
     effectiveCoverageGaps.propsNotEnumeratedFibers === 0
   const mounted: CohortInstance[] = mountedCandidates.map((entry) => ({
     componentName: entry.componentName,
-    status: entry.observed ? 'mounted-updated' : complete ? 'mounted-idle' : 'mounted-unknown',
+    status: entry.observed
+      ? 'mounted-updated'
+      : renderCoverageComplete && !entry.renderUnanalyzed
+        ? 'mounted-idle'
+        : 'mounted-unknown',
     instance: entry.instance,
   }))
   const unmounted: CohortInstance[] = observation
@@ -202,7 +211,7 @@ export function getRenderCohort(
       mountedIdle,
       mountedUnknown,
       unmounted: unmounted.length,
-      complete,
+      renderCoverageComplete,
     }),
     matched,
     mountedUpdated,
@@ -240,10 +249,9 @@ function cohortStatus(input: {
   mountedIdle: number
   mountedUnknown: number
   unmounted: number
-  complete: boolean
+  renderCoverageComplete: boolean
 }): CohortStatus {
   if (!input.observation) return 'not-started'
-  if (!input.complete) return 'unknown'
   const populated = [
     input.mountedUpdated,
     input.mountedIdle,
@@ -255,5 +263,5 @@ function cohortStatus(input: {
   if (input.mountedIdle > 0) return 'mounted-idle'
   if (input.mountedUnknown > 0) return 'unknown'
   if (input.unmounted > 0) return 'unmounted'
-  return 'absent'
+  return input.renderCoverageComplete ? 'absent' : 'unknown'
 }

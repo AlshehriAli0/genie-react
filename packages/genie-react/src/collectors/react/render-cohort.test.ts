@@ -5,6 +5,7 @@ import {
   beginInstanceObservation,
   clearInstanceIdentityForTests,
   noteInstanceRender,
+  noteUnanalyzedInstanceRender,
 } from './instance-identity'
 import { beginObservation, resetObservationStateForTests } from './observation'
 import { getRenderCohort } from './render-cohort'
@@ -210,6 +211,130 @@ describe('render lifecycle cohorts', () => {
         },
       ).status,
     ).toBe('unknown')
+  })
+
+  it('still answers idle for instances the commit walk reached when other fibers were skipped', () => {
+    const root = component('Root')
+    attach(root, [component('Row')])
+    commit(root)
+    startObservation()
+
+    expect(
+      getRenderCohort(
+        root,
+        { component: 'Row', exact: true, limit: 10 },
+        {
+          skippedCommitFibers: 408,
+          droppedUnmountFibers: 0,
+          analysisFailedFibers: 0,
+          truncatedInputFibers: 0,
+          budgetExhaustedCommits: 2,
+        },
+      ),
+    ).toMatchObject({
+      status: 'mounted-idle',
+      matched: 1,
+      mountedIdle: 1,
+      mountedUnknown: 0,
+      coverage: { complete: false, skippedCommitFibers: 408, budgetExhaustedCommits: 2 },
+    })
+  })
+
+  it('withholds a verdict only from the instances whose own render went unanalyzed', () => {
+    const root = component('Root')
+    const reached = component('Row', 'reached')
+    const declined = component('Row', 'declined')
+    attach(root, [reached, declined])
+    commit(root)
+    startObservation()
+    noteUnanalyzedInstanceRender(declined)
+
+    expect(
+      getRenderCohort(
+        root,
+        { component: 'Row', exact: true, limit: 10 },
+        {
+          skippedCommitFibers: 1,
+          droppedUnmountFibers: 0,
+          analysisFailedFibers: 0,
+          truncatedInputFibers: 0,
+        },
+      ),
+    ).toMatchObject({
+      status: 'mixed',
+      matched: 2,
+      mountedIdle: 1,
+      mountedUnknown: 1,
+    })
+  })
+
+  it('prefers an observed render over a later commit that skipped the same instance', () => {
+    const root = component('Root')
+    const row = component('Row')
+    attach(root, [row])
+    commit(root)
+    startObservation()
+    noteInstanceRender(row, 'update', 1, 1)
+    noteUnanalyzedInstanceRender(row)
+
+    expect(
+      getRenderCohort(
+        root,
+        { component: 'Row', exact: true, limit: 10 },
+        {
+          skippedCommitFibers: 1,
+          droppedUnmountFibers: 0,
+          analysisFailedFibers: 0,
+          truncatedInputFibers: 0,
+        },
+      ),
+    ).toMatchObject({ status: 'updated', mountedUpdated: 1, mountedUnknown: 0 })
+  })
+
+  it('keeps a recorded render answered even when an unrelated gap breaks coverage', () => {
+    const root = component('Root')
+    const row = component('Row')
+    attach(root, [row])
+    commit(root)
+    startObservation()
+    noteInstanceRender(row, 'update', 1, 1)
+
+    expect(
+      getRenderCohort(
+        root,
+        { component: 'Row', exact: true, limit: 10 },
+        {
+          skippedCommitFibers: 0,
+          droppedUnmountFibers: 0,
+          analysisFailedFibers: 1,
+          truncatedInputFibers: 0,
+        },
+      ),
+    ).toMatchObject({
+      status: 'updated',
+      mountedUpdated: 1,
+      mountedUnknown: 0,
+      coverage: { complete: false },
+    })
+  })
+
+  it('withholds every verdict when a gap could have hidden a render outright', () => {
+    const root = component('Root')
+    attach(root, [component('Row')])
+    commit(root)
+    startObservation()
+    const gaps = {
+      skippedCommitFibers: 0,
+      droppedUnmountFibers: 0,
+      analysisFailedFibers: 0,
+      truncatedInputFibers: 0,
+    }
+
+    for (const gap of ['droppedUnmountFibers', 'analysisFailedFibers'] as const) {
+      expect(
+        getRenderCohort(root, { component: 'Row', exact: true, limit: 10 }, { ...gaps, [gap]: 1 }),
+      ).toMatchObject({ status: 'unknown', mountedIdle: 0, mountedUnknown: 1 })
+    }
   })
 
   it('reports that measurement has not started instead of inventing an empty window', () => {

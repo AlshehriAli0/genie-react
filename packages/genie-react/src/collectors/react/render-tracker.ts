@@ -37,6 +37,7 @@ import {
   getInstanceIdentityCoverage,
   invalidateLiveInstancesForRefresh,
   noteInstanceRender,
+  noteUnanalyzedInstanceRender,
   prepareInstanceRender,
 } from './instance-identity'
 import {
@@ -286,7 +287,7 @@ export function startRenderTracking(): boolean {
               } else {
                 budget.skipped += 1
               }
-              skippedCommitFibers += 1
+              noteSkippedCommitFiber(fiber)
             }
             return
           }
@@ -308,7 +309,7 @@ export function startRenderTracking(): boolean {
           }
           if (candidates.length >= budget.limit) {
             budget.skipped += 1
-            skippedCommitFibers += 1
+            noteSkippedCommitFiber(fiber)
             return
           }
           candidates.push({ fiber, phase })
@@ -751,6 +752,12 @@ export async function rendersDiff(baseline: string, thresholdMs: number) {
   return diffRenderSnapshot(baseline, thresholdMs, commitsAtStart, clearsAtStart, after, coverage)
 }
 
+/** The commit walk reached this fiber and the budget declined it. It rendered, so the cohort must not read it as idle. */
+function noteSkippedCommitFiber(fiber: Fiber): void {
+  skippedCommitFibers += 1
+  noteUnanalyzedInstanceRender(fiber)
+}
+
 function shouldAnalyzeCommitFiber(fiber: Fiber): boolean {
   return (
     isCompositeFiber(fiber) ||
@@ -768,7 +775,7 @@ export function recordCommitFiber(
   if (!shouldAnalyzeCommitFiber(fiber)) return false
   if (!targeted && budget.processed >= budget.limit) {
     budget.skipped += 1
-    skippedCommitFibers += 1
+    noteSkippedCommitFiber(fiber)
     return false
   }
   const work = targeted ? budget.targetWork : budget.work
@@ -779,7 +786,7 @@ export function recordCommitFiber(
     } else {
       budget.skipped += 1
     }
-    skippedCommitFibers += 1
+    noteSkippedCommitFiber(fiber)
     return false
   }
   if (targeted) {
@@ -797,7 +804,7 @@ export function recordCommitFiber(
       } else {
         budget.skipped += 1
       }
-      skippedCommitFibers += 1
+      noteSkippedCommitFiber(fiber)
       return false
     }
     recordRender(fiber, phase, effectPreparation, work, budget.currentCommitEvidence)
