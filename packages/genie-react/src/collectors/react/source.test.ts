@@ -20,7 +20,10 @@ vi.mock('bippy/source', () => ({
   getSource: (fiber: { _debugSource?: unknown }) => getSource(fiber),
   formatOwnerStack: (stack: string) => formatOwnerStack(stack),
   parseStack: () => parseStack(),
-  isSourceFile: (file: string) => !file.includes('/node_modules/') && !file.includes('/.next/'),
+  isSourceFile: (file: string) =>
+    /\.(jsx|tsx|ts|js)$/.test(normalize(file)) &&
+    !file.includes('/node_modules/') &&
+    !file.includes('/.next/'),
   normalizeFileName: normalize,
   getFiberHooks: (fiber: unknown) => getFiberHooks(fiber),
   symbolicateStack: (frames: unknown[]) => symbolicateStack(frames),
@@ -84,6 +87,13 @@ describe('isLibraryFile', () => {
     expect(isLibraryFile('/apps/demo/.next/dev/server/chunks/ssr/root.js')).toBe(false)
     expect(isLibraryFile('/node_modules/.vite/deps/cmdk.js')).toBe(true)
     expect(isLibraryFile('/node_modules/.pnpm/@base-ui+react/dist/index.js')).toBe(true)
+  })
+
+  it('treats an unsymbolicated Metro bundle entry as app rather than hiding the whole app', () => {
+    expect(isLibraryFile('/index.bundle')).toBe(false)
+    expect(isLibraryFile('/.expo/.virtual-metro-entry.bundle')).toBe(false)
+    expect(isLibraryFile('/main.jsbundle')).toBe(false)
+    expect(isLibraryFile('/node_modules/react-native/Libraries/Text/Text.js')).toBe(true)
   })
 })
 
@@ -187,6 +197,109 @@ describe('classifyFiber', () => {
     const { source, isLibrary } = await classifyFiber(asFiber({}))
     expect(source).toBeNull()
     expect(isLibrary).toBe(false)
+  })
+})
+
+describe('Metro symbolication', () => {
+  const BUNDLE = 'http://127.0.0.1:8081/index.bundle?platform=android&dev=true'
+  type FetchMock = (url: string, init?: { method?: string; body?: string }) => Promise<unknown>
+  const respondWith = (frame: unknown) => ({ ok: true, json: async () => ({ stack: [frame] }) })
+
+  it('maps a Metro bundle frame to its app source through the dev server endpoint', async () => {
+    const fetchMock = vi.fn<FetchMock>(async () =>
+      respondWith({ file: '/app/(home)/index.tsx', lineNumber: 42, column: 7 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { source, isLibrary } = await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+
+    expect(source).toMatchObject({
+      file: '/app/(home)/index.tsx',
+      line: 42,
+      column: 7,
+      sourceMapConfidence: 'mapped',
+    })
+    expect(isLibrary).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:8081/symbolicate')
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST')
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body ?? 'null')).toEqual({
+      stack: [{ file: BUNDLE, lineNumber: 200, column: 0 }],
+    })
+  })
+
+  it('keeps a symbolicated dependency frame classified as library', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<FetchMock>(async () =>
+        respondWith({
+          file: '/node_modules/react-native/Libraries/Components/View/View.js',
+          lineNumber: 12,
+          column: 3,
+        }),
+      ),
+    )
+
+    const { source, isLibrary } = await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+
+    expect(source?.file).toBe('/node_modules/react-native/Libraries/Components/View/View.js')
+    expect(isLibrary).toBe(true)
+  })
+
+  it('ignores a symbolicate response that hands back the bundle entry', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<FetchMock>(async () => respondWith({ file: BUNDLE, lineNumber: 200, column: 0 })),
+    )
+
+    const { source, isLibrary } = await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+
+    expect(source).toMatchObject({
+      file: '/index.bundle',
+      line: 200,
+      sourceMapConfidence: 'served',
+    })
+    expect(isLibrary).toBe(false)
+  })
+
+  it('never downloads the bundle itself when symbolication fails', async () => {
+    const fetchMock = vi.fn<FetchMock>(async () => {
+      throw new Error('metro unreachable')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { source, isLibrary } = await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+
+    expect(source).toMatchObject({ file: '/index.bundle', line: 200, column: 0 })
+    expect(isLibrary).toBe(false)
+    expect(fetchMock.mock.calls.every(([url]) => url.endsWith('/symbolicate'))).toBe(true)
+  })
+
+  it('symbolicates a given bundle frame once across fibers, but retries after a failure', async () => {
+    const fetchMock = vi.fn<FetchMock>(async () => ({ ok: false, json: async () => null }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+    await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    fetchMock.mockResolvedValue(respondWith({ file: '/app/Late.tsx', lineNumber: 9, column: 1 }))
+    await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+    await classifyFiber(asFiber({ _debugSource: at(BUNDLE, 200) }))
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('leaves a non-Metro url on the source map path', async () => {
+    const fetchMock = vi.fn<FetchMock>(async () => {
+      throw new Error('no network in tests')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await classifyFiber(asFiber({ _debugSource: at('http://localhost:3100/src/App.tsx', 10) }))
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://localhost:3100/src/App.tsx')
+    expect(fetchMock.mock.calls[0]?.[1]).toBeUndefined()
   })
 })
 

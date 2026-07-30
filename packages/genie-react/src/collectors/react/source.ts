@@ -103,6 +103,7 @@ export function clearSourceCache(): void {
   cacheGeneration += 1
   cache.clear()
   pendingSource.clear()
+  metroFrameCache.clear()
   moduleMapCache.clear()
   warmupQueue = []
   activeWarmup = null
@@ -224,9 +225,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-/** A file outside the project tree is a library. Turbopack can expose app fibers as unmapped dev chunks; dependencies still resolve to node_modules paths. */
+/** A file outside the project tree is a library. Turbopack can expose app fibers as unmapped dev chunks, and an unsymbolicated Metro bundle entry names the whole app; neither carries attribution, so neither is evidence of a library. */
 export function isLibraryFile(file: string): boolean {
   if (file.replaceAll('\\', '/').includes('/.next/dev/server/chunks/')) return false
+  if (METRO_BUNDLE_PATH_RE.test(file)) return false
   return !isSourceFile(file)
 }
 
@@ -482,6 +484,61 @@ const INLINE_SOURCE_MAP_RE =
 
 const moduleMapCache = new Map<string, SourceMap | null>()
 
+interface MappedPosition {
+  file: string
+  line: number
+  column: number
+}
+
+const METRO_BUNDLE_PATH_RE = /\.(?:js)?bundle$/
+const METRO_BUNDLE_URL_RE = /^(https?:\/\/[^/?#]+)\/[^?#]*\.(?:js)?bundle(?:[?#]|$)/
+const metroFrameCache = new Map<string, MappedPosition>()
+
+/** Metro's dev bundle and its source map are both far too large to pull into the app, so ask the dev server the way LogBox does. Only successes are cached, so a transient failure can recover. */
+async function metroOriginalPosition(
+  origin: string,
+  servedUrl: string,
+  line: number,
+  column: number,
+  generation: number,
+): Promise<MappedPosition | null> {
+  const key = `${servedUrl}|${line}|${column}`
+  const cached = metroFrameCache.get(key)
+  if (cached) return cached
+  const mapped = await symbolicateMetroFrame(origin, servedUrl, line, column)
+  if (mapped && generation === cacheGeneration) metroFrameCache.set(key, mapped)
+  return mapped
+}
+
+async function symbolicateMetroFrame(
+  origin: string,
+  servedUrl: string,
+  line: number,
+  column: number,
+): Promise<MappedPosition | null> {
+  try {
+    const response = await fetch(`${origin}/symbolicate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ stack: [{ file: servedUrl, lineNumber: line, column }] }),
+    })
+    const payload: unknown = response.ok ? await response.json() : null
+    const frame = isRecord(payload) && Array.isArray(payload.stack) ? payload.stack[0] : null
+    if (!isRecord(frame) || typeof frame.file !== 'string') return null
+    if (typeof frame.lineNumber !== 'number') return null
+    // Metro echoes the bundle entry back when it cannot map the frame.
+    const file = normalizeFileName(frame.file)
+    if (!file || METRO_BUNDLE_PATH_RE.test(file)) return null
+    return {
+      file,
+      line: frame.lineNumber,
+      column: typeof frame.column === 'number' ? frame.column : column,
+    }
+  } catch {
+    return null
+  }
+}
+
 // bippy's symbolicator only fetches external map URLs; Vite inlines the map in dev, so decode it ourselves to recover original (not served/transformed) lines.
 async function inlineSourceMap(url: string, generation: number): Promise<SourceMap | null> {
   if (moduleMapCache.has(url)) return moduleMapCache.get(url) ?? null
@@ -510,6 +567,11 @@ async function toOriginalPosition(
   generation = cacheGeneration,
 ): Promise<{ file: string | null; line: number | null; column: number | null }> {
   if (typeof line !== 'number' || typeof column !== 'number') return { file: null, line, column }
+  const metroOrigin = METRO_BUNDLE_URL_RE.exec(servedUrl)?.[1]
+  if (metroOrigin) {
+    const mapped = await metroOriginalPosition(metroOrigin, servedUrl, line, column, generation)
+    return mapped ?? { file: null, line, column }
+  }
   // Vite inlines the map (our decoder); Next/Turbopack serve an external sourceMappingURL (bippy's fetcher).
   const map = (await inlineSourceMap(servedUrl, generation)) ?? (await externalSourceMap(servedUrl))
   const original = map ? getSourceFromSourceMap(map, line, column) : null
@@ -531,7 +593,7 @@ async function externalSourceMap(url: string): Promise<SourceMap | null> {
   }
 }
 
-// Classification prefers the served URL; the map's original file is trusted only when the served URL is an opaque bundle chunk (Next/Turbopack) AND the original classifies as app source — so a dep bundled into an app chunk stays library.
+// Classification prefers the served URL; the map's original file is trusted only when the served URL is an opaque bundle chunk (Next/Turbopack) AND the original classifies as app source — so a dep bundled into an app chunk stays library. A Metro bundle entry is the sole exception: it names the whole app, so any symbolicated path beats it, library ones included.
 async function resolveHookSource(
   hook: HookSource | null,
   generation: number,
@@ -571,7 +633,7 @@ function selectSourcePosition(
 ): Pick<ResolvedSource, 'file' | 'line' | 'column'> {
   if (
     original.file !== null &&
-    isSourceFile(original.file) &&
+    (isSourceFile(original.file) || METRO_BUNDLE_PATH_RE.test(servedFile)) &&
     (!isSourceFile(servedFile) || isAppBundleEntry(servedFile))
   ) {
     return { file: original.file, line: original.line, column: original.column }

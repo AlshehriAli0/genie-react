@@ -390,7 +390,10 @@ export function appOnlyFilteredNote(
 ): string | undefined {
   if (hidden <= 0) return undefined
   const label = subject === 'effects' ? 'app effects' : 'components shown'
-  return `${shown} ${label} (${hidden} library/unknown ${subject} hidden — set appOnly:false to include)`
+  const note = `${shown} ${label} (${hidden} library/unknown ${subject} hidden — set appOnly:false to include)`
+  return shown === 0
+    ? `WARNING: appOnly hid every result, so this is not evidence that nothing happened. ${note}`
+    : note
 }
 
 export async function buildTree(

@@ -25,7 +25,7 @@ const {
   takeSnapshot,
 } = await import('./render-tracker')
 const { clearEffects, getEffectAuditReport, recordEffect } = await import('./effect-tracker')
-const { buildTree } = await import('./fiber')
+const { appOnlyFilteredNote, buildTree } = await import('./fiber')
 const { noteDocumentCommit } = await import('./observation')
 const { clearSourceCache } = await import('./source')
 
@@ -401,6 +401,29 @@ describe('getEffectAuditReport filteredNote count', () => {
         ],
       },
     ])
+  })
+})
+
+describe('appOnlyFilteredNote', () => {
+  it('stays a plain disclosure while anything survives the filter', () => {
+    expect(appOnlyFilteredNote(3, 12, 'components')).toBe(
+      '3 components shown (12 library/unknown components hidden — set appOnly:false to include)',
+    )
+    expect(appOnlyFilteredNote(1, 37, 'effects')).toBe(
+      '1 app effects (37 library/unknown effects hidden — set appOnly:false to include)',
+    )
+  })
+
+  it('escalates to a warning when the filter hides every result', () => {
+    expect(appOnlyFilteredNote(0, 148, 'components')).toBe(
+      'WARNING: appOnly hid every result, so this is not evidence that nothing happened. 0 components shown (148 library/unknown components hidden — set appOnly:false to include)',
+    )
+    expect(appOnlyFilteredNote(0, 37, 'effects')).toMatch(/^WARNING: appOnly hid every result/)
+  })
+
+  it('says nothing when nothing was hidden', () => {
+    expect(appOnlyFilteredNote(0, 0, 'components')).toBeUndefined()
+    expect(appOnlyFilteredNote(5, 0, 'effects')).toBeUndefined()
   })
 })
 
