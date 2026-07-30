@@ -195,6 +195,10 @@ const DEFAULT_OBSERVATION_CONFIGURATION: RenderObservationConfiguration = {
 let observationConfiguration = structuredClone(DEFAULT_OBSERVATION_CONFIGURATION)
 let observationRootIds = new Set<number>()
 
+const ADAPTIVE_FIBER_CEILING = 20_000
+const ADAPTIVE_OPERATION_CEILING = 2_000_000
+const ADAPTIVE_TIME_CEILING_MS = 500
+
 const DID_CAPTURE = 0b1000_0000
 const RECENT_CAUSE_EVENT_LIMIT = 1_000
 const pendingUnmounts: { rendererId: number; fiber: Fiber; targeted: boolean }[] = []
@@ -511,13 +515,18 @@ function configureRenderObservation(options: RenderObservationOptions): void {
   observationRootIds = new Set(observationConfiguration.roots)
 }
 
+function grown(configured: number, scale: number, ceiling: number): number {
+  return Math.max(configured, Math.min(ceiling, configured * scale))
+}
+
 function effectiveObservationBudget(): RenderObservationConfiguration['budget'] {
   const scale = observationConfiguration.budget.adaptive ? adaptiveBudgetScale : 1
+  const configured = observationConfiguration.budget
   return {
-    ...observationConfiguration.budget,
-    fiberLimit: Math.min(5_000, observationConfiguration.budget.fiberLimit * scale),
-    operationLimit: Math.min(200_000, observationConfiguration.budget.operationLimit * scale),
-    timeLimitMs: Math.min(50, observationConfiguration.budget.timeLimitMs * scale),
+    ...configured,
+    fiberLimit: grown(configured.fiberLimit, scale, ADAPTIVE_FIBER_CEILING),
+    operationLimit: grown(configured.operationLimit, scale, ADAPTIVE_OPERATION_CEILING),
+    timeLimitMs: grown(configured.timeLimitMs, scale, ADAPTIVE_TIME_CEILING_MS),
   }
 }
 
