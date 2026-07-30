@@ -37,6 +37,7 @@ import {
   getInstanceIdentityCoverage,
   invalidateLiveInstancesForRefresh,
   noteInstanceRender,
+  noteUnanalyzedInstanceRender,
   prepareInstanceRender,
 } from './instance-identity'
 import {
@@ -202,7 +203,7 @@ const DID_CAPTURE = 0b1000_0000
 const RECENT_CAUSE_EVENT_LIMIT = 1_000
 const pendingUnmounts: { rendererId: number; fiber: Fiber; targeted: boolean }[] = []
 const pendingHostUnmountRenderers = new Set<number>()
-let uncertainTraversalRoots = new WeakSet<FiberRoot>()
+let uncertainTraversalRoots = new WeakMap<FiberRoot, string | null>()
 
 let commitListener: (() => void) | null = null
 
@@ -237,7 +238,10 @@ export function startRenderTracking(): boolean {
         commitListener?.()
         noteCommit()
         noteCommittedRoot(root)
-        if (!isSafeRenderer(rendererId)) return
+        if (!isSafeRenderer(rendererId)) {
+          if (getActiveObservation()) analysisFailedFibers += 1
+          return
+        }
         const hostUnmountObserved = pendingHostUnmountRenderers.delete(rendererId)
         if (isRefreshCommit()) {
           advanceExcludedCommitBaseline(root)
@@ -251,12 +255,22 @@ export function startRenderTracking(): boolean {
         recordResultingEffectCommit(getDocumentCommitId())
         if (paused) {
           discardPendingUnmounts(rendererId)
+          const failuresBeforeRecovery = analysisFailedFibers
           advanceExcludedCommitBaseline(root)
+          if (analysisFailedFibers === failuresBeforeRecovery) analysisFailedFibers += 1
           return
         }
         if (uncertainTraversalRoots.has(root)) {
+          const uncertaintyObservationId = uncertainTraversalRoots.get(root)
           discardPendingUnmounts(rendererId)
+          const failuresBeforeRecovery = analysisFailedFibers
           advanceExcludedCommitBaseline(root)
+          if (
+            uncertaintyObservationId !== (getActiveObservation()?.id ?? null) &&
+            analysisFailedFibers === failuresBeforeRecovery
+          ) {
+            analysisFailedFibers += 1
+          }
           return
         }
         commits += 1
@@ -276,47 +290,56 @@ export function startRenderTracking(): boolean {
         budget.currentCommitEvidence.hostMutationCaptureComplete = !hostUnmountObserved
         const candidates: { fiber: Fiber; phase: RenderPhase }[] = []
         const targetedCandidates: { fiber: Fiber; phase: RenderPhase }[] = []
-        traverseRenderedFibers(root, (fiber, phase) => {
-          const targeted = isObservationTarget(fiber)
-          const traversalWork = targeted ? budget.targetWork : budget.work
-          if (
-            !consumeCommitWork(traversalWork, targeted ? 'target-traversal' : 'commit-traversal')
-          ) {
-            budget.currentCommitEvidence.hostMutationCaptureComplete = false
-            if (shouldAnalyzeCommitFiber(fiber)) {
-              if (targeted) {
-                budget.targetSkipped += 1
-                targetedFibersSkipped += 1
-              } else {
-                budget.skipped += 1
-              }
-              skippedCommitFibers += 1
-            }
-            return
-          }
-          budget.currentCommitEvidence.renderedFibers.add(fiber)
-          if (isHostFiber(fiber)) {
-            try {
-              // The traversal proves this host rendered now; its mutation flag is not used alone.
-              if (didFiberCommit(fiber)) {
-                budget.currentCommitEvidence.hostMutationFibers.add(fiber)
-              }
-            } catch {
+        try {
+          traverseRenderedFibers(root, (fiber, phase) => {
+            const targeted = isObservationTarget(fiber)
+            const traversalWork = targeted ? budget.targetWork : budget.work
+            if (
+              !consumeCommitWork(traversalWork, targeted ? 'target-traversal' : 'commit-traversal')
+            ) {
               budget.currentCommitEvidence.hostMutationCaptureComplete = false
+              if (shouldAnalyzeCommitFiber(fiber)) {
+                if (targeted) {
+                  budget.targetSkipped += 1
+                  targetedFibersSkipped += 1
+                } else {
+                  budget.skipped += 1
+                }
+                noteSkippedCommitFiber(fiber)
+              }
+              return
             }
-          }
-          if (!shouldAnalyzeCommitFiber(fiber)) return
-          if (targeted) {
-            targetedCandidates.push({ fiber, phase })
-            return
-          }
-          if (candidates.length >= budget.limit) {
-            budget.skipped += 1
-            skippedCommitFibers += 1
-            return
-          }
-          candidates.push({ fiber, phase })
-        })
+            budget.currentCommitEvidence.renderedFibers.add(fiber)
+            if (isHostFiber(fiber)) {
+              try {
+                // The traversal proves this host rendered now; its mutation flag is not used alone.
+                if (didFiberCommit(fiber)) {
+                  budget.currentCommitEvidence.hostMutationFibers.add(fiber)
+                }
+              } catch {
+                budget.currentCommitEvidence.hostMutationCaptureComplete = false
+              }
+            }
+            if (!shouldAnalyzeCommitFiber(fiber)) return
+            if (targeted) {
+              targetedCandidates.push({ fiber, phase })
+              return
+            }
+            if (candidates.length >= budget.limit) {
+              budget.skipped += 1
+              noteSkippedCommitFiber(fiber)
+              return
+            }
+            candidates.push({ fiber, phase })
+          })
+        } catch {
+          budget.currentCommitEvidence.hostMutationCaptureComplete = false
+          budget.failed += 1
+          analysisFailedFibers += 1
+          uncertainTraversalRoots.set(root, getActiveObservation()?.id ?? null)
+          finalizeCommitAnalysisBudget(budget)
+          return
+        }
         for (const candidate of targetedCandidates) {
           recordCommitFiber(candidate.fiber, candidate.phase, budget, true)
         }
@@ -340,7 +363,7 @@ function advanceExcludedCommitBaseline(root: FiberRoot): void {
     traverseRenderedFibers(root, () => {})
     uncertainTraversalRoots.delete(root)
   } catch {
-    uncertainTraversalRoots.add(root)
+    uncertainTraversalRoots.set(root, getActiveObservation()?.id ?? null)
     analysisFailedFibers += 1
   }
 }
@@ -348,16 +371,16 @@ function advanceExcludedCommitBaseline(root: FiberRoot): void {
 /** Module/HMR teardown only. Profiling stop must keep the lightweight commit heartbeat installed. */
 export function disposeRenderTracking(): void {
   noteAnalysisInvalidation()
+  for (const pending of pendingUnmounts) discardExcludedInstanceUnmount(pending.fiber)
+  pendingUnmounts.length = 0
   invalidateLiveInstancesForRefresh()
   instrumentation?.()
   instrumentation = null
   instrumentedHook = null
   installed = false
   paused = false
-  pendingUnmounts.length = 0
   pendingHostUnmountRenderers.clear()
-  uncertainTraversalRoots = new WeakSet()
-  droppedPendingUnmountFibers = 0
+  uncertainTraversalRoots = new WeakMap()
 }
 
 /** Pause commit recording without uninstalling instrumentation; isTracking() reports false until startRenderTracking() resumes. */
@@ -369,6 +392,7 @@ export const isTracking = (): boolean => installed && !paused
 export const getCommitCount = (): number => commits
 export const getSkippedCommitFiberCount = (): number => skippedCommitFibers
 export const getDroppedPendingUnmountFiberCount = (): number => droppedPendingUnmountFibers
+export const getPendingUnmountFiberCount = (): number => pendingUnmounts.length
 export const getAnalysisFailedFiberCount = (): number => analysisFailedFibers
 export const getTruncatedInputFiberCount = (): number => truncatedInputFibers
 export const getPropsNotEnumeratedFiberCount = (): number => propsNotEnumeratedFibers
@@ -760,6 +784,12 @@ export async function rendersDiff(baseline: string, thresholdMs: number) {
   return diffRenderSnapshot(baseline, thresholdMs, commitsAtStart, clearsAtStart, after, coverage)
 }
 
+/** The commit walk reached this fiber and the budget declined it. It rendered, so the cohort must not read it as idle. */
+function noteSkippedCommitFiber(fiber: Fiber): void {
+  skippedCommitFibers += 1
+  noteUnanalyzedInstanceRender(fiber)
+}
+
 function shouldAnalyzeCommitFiber(fiber: Fiber): boolean {
   return (
     isCompositeFiber(fiber) ||
@@ -777,7 +807,7 @@ export function recordCommitFiber(
   if (!shouldAnalyzeCommitFiber(fiber)) return false
   if (!targeted && budget.processed >= budget.limit) {
     budget.skipped += 1
-    skippedCommitFibers += 1
+    noteSkippedCommitFiber(fiber)
     return false
   }
   const work = targeted ? budget.targetWork : budget.work
@@ -788,7 +818,7 @@ export function recordCommitFiber(
     } else {
       budget.skipped += 1
     }
-    skippedCommitFibers += 1
+    noteSkippedCommitFiber(fiber)
     return false
   }
   if (targeted) {
@@ -806,7 +836,7 @@ export function recordCommitFiber(
       } else {
         budget.skipped += 1
       }
-      skippedCommitFibers += 1
+      noteSkippedCommitFiber(fiber)
       return false
     }
     recordRender(fiber, phase, effectPreparation, work, budget.currentCommitEvidence)
@@ -1068,6 +1098,10 @@ function prepareCauseEventEvidence(
 function recordPendingUnmounts(rendererId: number, budget: CommitAnalysisBudget): void {
   const retained: { rendererId: number; fiber: Fiber; targeted: boolean }[] = []
   for (const pending of pendingUnmounts) {
+    if (pending.rendererId !== rendererId) {
+      retained.push(pending)
+      continue
+    }
     const work = pending.targeted ? budget.targetWork : budget.work
     if (
       !consumeCommitWork(work, pending.targeted ? 'target-pending-unmounts' : 'pending-unmounts')
@@ -1077,10 +1111,6 @@ function recordPendingUnmounts(rendererId: number, budget: CommitAnalysisBudget)
         budget.targetSkipped += 1
         targetedFibersSkipped += 1
       }
-      continue
-    }
-    if (pending.rendererId !== rendererId) {
-      retained.push(pending)
       continue
     }
     if (!isCompositeFiber(pending.fiber)) continue

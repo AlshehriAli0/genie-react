@@ -643,7 +643,11 @@ export const reactComponentCohortContract = defineAgentToolContract({
       }),
     ),
     coverage: z.object({
-      complete: z.boolean().describe('Completeness of lifecycle and cohort observation.'),
+      complete: z
+        .boolean()
+        .describe(
+          'Global completeness of lifecycle and cohort capture; returned per-instance statuses can remain authoritative when false.',
+        ),
       inputAttributionComplete: z.boolean(),
       scannedFibers: z.number().int().nonnegative(),
       scanLimit: z.number().int().positive(),
